@@ -59,6 +59,9 @@ const messages = [{
   cwd,
 }];
 
+const RECOVERY_NOTICE =
+  'Previous settings could not be parsed. They were preserved at /tmp/settings.json.corrupt-1';
+
 function summary() {
   return {
     id: sessionId,
@@ -114,6 +117,9 @@ function registerHandlers() {
   ipcMain.handle('settings:get', () => ({
     editorScheme: 'vscode',
     version: '9.8.7-test',
+    // #42: the main process reports this when it moved an unparseable settings file aside
+    // before overwriting it. Rendering it here is what closes the loop on that notice.
+    settingsRecovery: RECOVERY_NOTICE,
   }));
   ipcMain.handle('settings:set', (_event, key, value) => {
     settingCalls.push({ key, value });
@@ -216,6 +222,7 @@ async function run() {
       label: trigger?.textContent?.trim() || null,
       nativeSelects: document.querySelectorAll('select').length,
       version: document.querySelector('.version-text')?.textContent?.trim() || null,
+      recovery: document.querySelector('.settings-recovery')?.textContent?.trim() || null,
     };
   })()`, true);
 
@@ -230,6 +237,10 @@ async function run() {
   assert(settingsState.label.includes('VS Code'), `editor picker uses a readable label (${settingsState.label})`);
   assert(settingsState.nativeSelects === 0, 'Settings does not fall back to a native select');
   assert(settingsState.version === 'Obelisk 9.8.7-test', `Settings renders the IPC app version (${settingsState.version})`);
+  assert(
+    settingsState.recovery === RECOVERY_NOTICE,
+    `Settings renders the preserved-settings notice (${settingsState.recovery})`,
+  );
 
   await win.webContents.executeJavaScript(
     `document.querySelector('.editor-picker-trigger').click()`, true,

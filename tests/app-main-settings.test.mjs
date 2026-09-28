@@ -6,7 +6,7 @@ import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { acquireWriterLease } from '../packages/core/src/writer-lease.ts';
@@ -1882,5 +1882,166 @@ test('the win:control IPC applies only whitelisted window actions to the sender 
     restoreEnvVar('HOME', originalHome);
     restoreEnvVar('USERPROFILE', originalProfile);
     rmSync(home, { recursive: true, force: true });
+  }
+});
+
+
+// Loads the app main module against a throwaway home so a test can drive the real
+// settings IPC handlers. Mirrors loadMainForWindowFlags, but returns the captured
+// handlers and the temp home instead of the opened windows.
+async function loadMainForSettings({ settingsText } = {}) {
+  const originalHome = process.env.HOME;
+  const originalProfile = process.env.USERPROFILE;
+  const home = makeTempDir(`obelisk-main-settings-${Date.now()}-${Math.random()}`);
+  mkdirSync(join(home, '.obelisk'), { recursive: true });
+  writeFileSync(join(home, '.obelisk', 'obelisk.sqlite'), '');
+  if (settingsText !== undefined) {
+    writeFileSync(join(home, '.obelisk', 'settings.json'), settingsText);
+  }
+  process.env.HOME = home;
+  process.env.USERPROFILE = home; // os.homedir() reads USERPROFILE on Windows
+
+  const ipcHandlers = new Map();
+
+  class FakeDatabase {
+    pragma() {}
+    exec() {}
+    close() {}
+    prepare() {
+      return { get: () => null, all: () => [], run: () => ({}) };
+    }
+  }
+
+  class FakeBrowserWindow {
+    constructor() {
+      this.webContents = {
+        on() {},
+        setWindowOpenHandler() {},
+        getURL() { return ''; },
+        setZoomLevel() {},
+        openDevTools() {},
+        send() {},
+      };
+    }
+    loadFile() {}
+    on() {}
+    loadURL() {}
+    close() {}
+    static getAllWindows() { return []; }
+    static fromWebContents() { return null; }
+  }
+
+  const restore = registerMocks([
+    [ELECTRON_URL, {
+      namedExports: electronNamespace({
+        app: {
+          whenReady: () => Promise.resolve(),
+          on() {},
+          quit() {},
+          getVersion: () => '9.8.7-test',
+        },
+        BrowserWindow: FakeBrowserWindow,
+        ipcMain: {
+          handle(channel, handler) {
+            ipcHandlers.set(channel, handler);
+          },
+        },
+      }),
+    }],
+    [DATABASE_URL, { defaultExport: FakeDatabase }],
+    [WATCHER_URL, { namedExports: noopWatcher() }],
+    [INDEXER_URL, { namedExports: { writeHeartbeat() {} } }],
+    [INDEXER_SERVICE_URL, { namedExports: defaultIndexerService() }],
+    [INDEXER_WORKER_URL, { namedExports: defaultIndexerWorkerClient() }],
+  ]);
+
+  const cleanup = () => {
+    restore();
+    restoreEnvVar('HOME', originalHome);
+    restoreEnvVar('USERPROFILE', originalProfile);
+    rmSync(home, { recursive: true, force: true });
+  };
+
+  try {
+    await importMain();
+  } catch (error) {
+    cleanup();
+    throw error;
+  }
+  return { ipcHandlers, home, cleanup };
+}
+
+function corruptSettingsBackups(home) {
+  return readdirSync(join(home, '.obelisk')).filter(name => name.startsWith('settings.json.corrupt-'));
+}
+
+// A corrupt settings file cannot be parsed, so overwriting it is the only practical way to
+// recover — the app has to keep working. What must not happen is the previous content
+// vanishing silently, so it is moved aside and the user is told where it went.
+test('saving over a corrupt settings file preserves it aside and reports where', async () => {
+  // Unparseable: a Windows path written with single backslashes, the shape a hand edit
+  // produces. JSON.stringify always escapes them, so only manual edits look like this.
+  // One backslash built from its char code: a literal backslash is easy to lose to
+  // editor/tool escaping, and a fixture that silently stays valid would make this test
+  // pass for the wrong reason. The assertion below pins it as unparseable.
+  const backslash = String.fromCharCode(92);
+  const corruptText = [
+    '{',
+    '  "providerRoots": {',
+    `    "claude": "C:${backslash}Users${backslash}probe${backslash}.claude"`,
+    '  },',
+    '  "editorScheme": "cursor"',
+    '}',
+  ].join('\n');
+  assert.throws(() => JSON.parse(corruptText), 'the fixture must be unparseable');
+
+  const { ipcHandlers, home, cleanup } = await loadMainForSettings({ settingsText: corruptText });
+  try {
+    await ipcHandlers.get('settings:set')(null, 'editorScheme', 'zed');
+
+    const backups = corruptSettingsBackups(home);
+    assert.equal(backups.length, 1, 'the unparseable file was moved aside exactly once');
+    assert.equal(
+      readFileSync(join(home, '.obelisk', backups[0]), 'utf8'),
+      corruptText,
+      'the preserved copy is byte-identical to the file the user had',
+    );
+
+    const saved = JSON.parse(readFileSync(join(home, '.obelisk', 'settings.json'), 'utf8'));
+    assert.deepEqual(saved, { editorScheme: 'zed' }, 'the save itself behaves exactly as before');
+
+    const settings = await ipcHandlers.get('settings:get')();
+    assert.match(settings.settingsRecovery, /could not be parsed/);
+    assert.ok(
+      settings.settingsRecovery.includes(backups[0]),
+      'the notice names the path the previous file was preserved at',
+    );
+  } finally {
+    cleanup();
+  }
+});
+
+test('saving over a valid settings file keeps every other setting and reports no recovery', async () => {
+  const validText = JSON.stringify({
+    providerRoots: { pi: '/custom/pi' },
+    editorScheme: 'cursor',
+    autoRefresh: true,
+  });
+
+  const { ipcHandlers, home, cleanup } = await loadMainForSettings({ settingsText: validText });
+  try {
+    await ipcHandlers.get('settings:set')(null, 'editorScheme', 'zed');
+
+    assert.deepEqual(corruptSettingsBackups(home), [], 'a parseable file is never moved aside');
+
+    const saved = JSON.parse(readFileSync(join(home, '.obelisk', 'settings.json'), 'utf8'));
+    assert.equal(saved.editorScheme, 'zed');
+    assert.deepEqual(saved.providerRoots, { pi: '/custom/pi' }, 'unrelated settings survive');
+    assert.equal(saved.autoRefresh, true);
+
+    const settings = await ipcHandlers.get('settings:get')();
+    assert.equal(settings.settingsRecovery, null, 'no recovery notice when nothing was preserved');
+  } finally {
+    cleanup();
   }
 });

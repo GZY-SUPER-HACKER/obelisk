@@ -78,6 +78,11 @@ let indexerService;
 let indexerWorker;
 let latestSourceIssues: ProviderSourceIssue[] = [];
 let latestSettingsError: string | null = null;
+// A recovery notice is deliberately kept apart from latestSettingsError: that variable
+// also gates the indexer (startIndexerService, migrations, rebuildIndex all treat a
+// non-null value as "settings unusable"). Once a corrupt file has been moved aside the
+// settings ARE usable again, so the notice must not block those paths.
+let latestSettingsRecovery: string | null = null;
 
 type WriterLeaseMode = 'acquire' | 'caller-held';
 
@@ -996,6 +1001,30 @@ ipcMain.handle('recap:read', (_, filename) => {
 
 const SETTINGS_PATH = path.join(OBELISK_DIR, 'settings.json');
 
+// A corrupt settings file cannot be parsed, so overwriting it is the only practical way
+// to recover — the app has to keep working. What must not happen is the previous content
+// vanishing silently. Move it aside first so the user can still read or repair it by hand.
+// Returns the path the unparseable file was preserved at, or null when there was nothing
+// to preserve (no file, or a file that still parses).
+function quarantineCorruptSettings() {
+  if (!fs.existsSync(SETTINGS_PATH)) return null;
+  try {
+    JSON.parse(fs.readFileSync(SETTINGS_PATH, 'utf8'));
+    return null;
+  } catch {}
+  // Date.now() rather than an ISO timestamp: ISO carries colons, which are not legal in a
+  // Windows file name.
+  const backupPath = `${SETTINGS_PATH}.corrupt-${Date.now()}`;
+  try {
+    fs.renameSync(SETTINGS_PATH, backupPath);
+    return backupPath;
+  } catch {
+    // Preserving the file is best effort. A failure here must not stop the save; the
+    // overwrite proceeds exactly as it did before, only without a backup.
+    return null;
+  }
+}
+
 function loadPersistedSettings() {
   const result = readPersistedProviderSettings(SETTINGS_PATH);
   latestSettingsError = result.ok ? null : result.error ?? 'Obelisk settings are unavailable';
@@ -1071,13 +1100,22 @@ ipcMain.handle('settings:get', () => {
     lastIndexed,
     status: connected ? 'ok' : 'error',
     statusText: latestSettingsError ?? (connected ? 'Connected' : 'No source folders found'),
+    settingsRecovery: latestSettingsRecovery,
   };
 });
 
 ipcMain.handle('settings:set', async (_, key, value) => {
   const persisted = loadPersistedSettings();
+  // Preserve an unparseable file before the write below replaces it. Runs before the
+  // save, and re-reads the file itself rather than trusting latestSettingsError, so a
+  // stale flag from an earlier read cannot skip or repeat the quarantine.
+  const backupPath = quarantineCorruptSettings();
   const providerRootChanged = setPersistedSetting(persisted, key, value);
   savePersistedSettings(persisted);
+  if (backupPath !== null) {
+    latestSettingsRecovery = `Previous settings could not be parsed. They were preserved at ${backupPath}`;
+    console.warn(latestSettingsRecovery);
+  }
 
   if (key === 'autoRefresh') {
     if (value === false && indexerService) {

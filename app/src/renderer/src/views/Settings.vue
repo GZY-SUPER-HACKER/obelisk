@@ -23,6 +23,7 @@ const editorMenuOpen = ref(false);
 const memoryCount = ref(0);
 const rebuilding = ref(false);
 const rebuildError = ref('');
+const settingsRecovery = ref('');
 const version = ref('');
 let stopIndexUpdates = null;
 
@@ -51,6 +52,7 @@ async function loadSettings({ preserveRecapPath = false } = {}) {
   autoRefresh.value = s.autoRefresh !== false;
   editorScheme.value = s.editorScheme || 'vscode';
   memoryCount.value = s.memoryCount || 0;
+  settingsRecovery.value = s.settingsRecovery || '';
   version.value = s.version || '';
 }
 
@@ -152,6 +154,11 @@ function fmtRelative(iso) {
         <div class="settings-section-head">
           <h2>Data Sources</h2>
           <p>Where Obelisk reads your agent session history.</p>
+        </div>
+
+        <div v-if="settingsRecovery" class="status-row warn settings-recovery">
+          <span class="status-dot warn"></span>
+          <span>{{ settingsRecovery }}</span>
         </div>
 
         <div
@@ -484,6 +491,8 @@ function fmtRelative(iso) {
 .status-row.ok { border-color: rgba(52,211,153,0.20); background: rgba(52,211,153,0.04); }
 .status-row.warn { border-color: rgba(251,191,36,0.20); background: rgba(251,191,36,0.04); }
 .status-row.error { border-color: rgba(248,113,113,0.20); background: rgba(248,113,113,0.04); }
+/* #42: one-line notice that a corrupt settings file was moved aside before being replaced. */
+.settings-recovery { margin-bottom: 10px; word-break: break-all; }
 
 .status-dot {
   width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0;
