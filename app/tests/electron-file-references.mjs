@@ -68,7 +68,7 @@ const messages = [{
 }];
 
 const RECOVERY_NOTICE =
-  'Previous settings could not be parsed. They were preserved at /tmp/settings.json.corrupt-1';
+  'Previous settings could not be read. They were preserved at /tmp/settings.json.corrupt-1';
 
 function summary() {
   return {
@@ -140,9 +140,10 @@ function registerHandlers() {
     const snapshot = {
       editorScheme: 'vscode',
       version: '9.8.7-test',
-      // #42: the main process reports this when it moved an unparseable settings file aside
-      // before overwriting it. Rendering it here is what closes the loop on that notice.
-      settingsRecovery: RECOVERY_NOTICE,
+      // #42: nothing has been preserved yet when the page first loads — the file is only moved
+      // aside by a save. The notice therefore has to arrive on the save response, because the
+      // editor path does not reload settings afterwards.
+      settingsRecovery: null,
       recapDir: '/fixture/persisted-recap',
       sources: [{
         id: 'copilot', name: 'GitHub Copilot', vendor: 'GitHub', color: '#8957e5',
@@ -172,7 +173,7 @@ function registerHandlers() {
       stableEnabled = value;
       stableWritesCompleted++;
     }
-    return true;
+    return { settingsRecovery: RECOVERY_NOTICE };
   });
   ipcMain.handle('file-ref:open', (_event, ref) => {
     openCalls.push(ref);
@@ -311,8 +312,8 @@ async function run() {
   assert(settingsState.nativeSelects === 0, 'Settings does not fall back to a native select');
   assert(settingsState.version === 'Obelisk 9.8.7-test', `Settings renders the IPC app version (${settingsState.version})`);
   assert(
-    settingsState.recovery === RECOVERY_NOTICE,
-    `Settings renders the preserved-settings notice (${settingsState.recovery})`,
+    settingsState.recovery === null,
+    `no recovery notice before a save has preserved anything (${settingsState.recovery})`,
   );
 
   const copilotCheckboxes = await win.webContents.executeJavaScript(`(() =>
@@ -389,6 +390,16 @@ async function run() {
   assert(
     settingCalls.some(call => call.key === 'editorScheme' && call.value === 'cursor'),
     `editor picker persists the selected scheme (${JSON.stringify(settingCalls)})`,
+  );
+
+  // The transition the save path has to cover: this route saves without reloading settings,
+  // so the notice can only appear here if the save response is what drives it.
+  const recoveryAfterSave = await win.webContents.executeJavaScript(
+    `document.querySelector('.settings-recovery')?.textContent?.trim() || null`, true,
+  );
+  assert(
+    recoveryAfterSave === RECOVERY_NOTICE,
+    `changing the editor surfaces a notice that was not there on load (${recoveryAfterSave})`,
   );
 
   win.destroy();
